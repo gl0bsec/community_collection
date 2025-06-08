@@ -1,0 +1,14 @@
+pandas
+spacy
+numpy
+tqdm
+transformers
+torch
+pacmap
+PyMuPDF
+semchunk
+hdbscan
+scikit-learn
+umap-learn
+bertopic
+nltk
