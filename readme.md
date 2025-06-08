@@ -16,3 +16,5 @@ community_collection/
 ```
 
 Import functions from these modules to build your own scripts.
+
+A small example pipeline is provided in `example_pipeline.ipynb` to illustrate how the package can be used.
