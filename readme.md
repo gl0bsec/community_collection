@@ -30,7 +30,7 @@ community_collection/
 **mapping.py**
 
 - Provides helpers for tokenisation and Jaccard similarity.
-- Includes functions for text chunking and embedding via `vectorise` and `improved_vectorise`.
+ - Includes functions for text chunking and embedding via `make_embedding`.
 - Supports dimensionality reduction, clustering and topic modelling utilities.
 - Contains helpers for handling CSV, PDF and zipped input files.
 
