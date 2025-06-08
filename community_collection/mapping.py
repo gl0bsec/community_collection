@@ -73,40 +73,76 @@ def batch_generator(iterable: Iterable, batch_size: int) -> Generator[List, None
         yield list(itertools.chain([first], itertools.islice(iterator, batch_size - 1)))
 
 
-def vectorise(
+def make_embedding(
     texts: List[List[str]],
-    model: str = "avsolatorio/GIST-large-Embedding-v0",
+    model: str = "intfloat/multilingual-e5-large-instruct",
     normalise: bool = True,
     batch_size: int = 192,
     gpu: bool = True,
     progress: bool = True,
-) -> List[List[float]]:
-    model_instance: BertModel = AutoModel.from_pretrained(model)
+    return_chunk_vectors: bool = False,
+    instruction_prefix: str | None = None,
+) -> List[List[float]] | Tuple[List[List[float]], List[List[float]]]:
+    """Generate document embeddings and optionally chunk embeddings.
+
+    Parameters mirror the previous ``vectorise`` and ``improved_vectorise``
+    functions. ``texts`` should be a list of lists where each sub list contains
+    the chunks for a document. When ``instruction_prefix`` is provided each
+    chunk is prefixed with that text before embedding. Set
+    ``return_chunk_vectors`` to ``True`` to also return vectors for each chunk.
+    """
+
+    model_instance = AutoModel.from_pretrained(model)
     tokeniser = AutoTokenizer.from_pretrained(model)
     if gpu and torch.cuda.is_available():
         model_instance = model_instance.to("cuda")
-    chunks = []
-    boundaries = []
-    start = 0
-    for text in texts:
-        chunks.extend(text)
-        boundaries.append((start, (start := start + len(text))))
+    else:
+        gpu = False
+        if torch.cuda.device_count() == 0:
+            print("GPU not available, using CPU instead")
 
-    vectors: List[torch.Tensor] = []
-    with tqdm(total=len(chunks), disable=not progress, unit=" text") as bar:
-        for batch in batch_generator(chunks, batch_size):
-            batch_enc = tokeniser(batch, padding=True, truncation=True, return_tensors="pt")
+    all_chunks: List[str] = []
+    boundaries: List[Tuple[int, int]] = []
+    start = 0
+    for text_chunks in texts:
+        if instruction_prefix is not None:
+            processed = [instruction_prefix + chunk for chunk in text_chunks]
+        else:
+            processed = list(text_chunks)
+        all_chunks.extend(processed)
+        boundaries.append((start, start + len(text_chunks)))
+        start += len(text_chunks)
+
+    chunk_vectors: List[List[float]] = []
+    with tqdm(total=len(all_chunks), disable=not progress, unit=" chunk") as bar:
+        for batch in batch_generator(all_chunks, batch_size):
+            inputs = tokeniser(
+                batch,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+                max_length=512,
+            )
             if gpu and torch.cuda.is_available():
-                batch_enc = batch_enc.to("cuda")
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
             with torch.no_grad():
-                out = model_instance(**batch_enc)[0][:, 0]
+                outputs = model_instance(**inputs)
+                batch_vec = outputs[0][:, 0]
                 if normalise:
-                    out = torch.nn.functional.normalize(out, p=2, dim=1)
-                out = out.cpu()
-                vectors.extend(out)
+                    batch_vec = torch.nn.functional.normalize(batch_vec, p=2, dim=1)
+                batch_vec = batch_vec.cpu()
+                chunk_vectors.extend(batch_vec.tolist())
             bar.update(len(batch))
 
-    return [torch.mean(torch.stack(vectors[start:end]), dim=0).tolist() for start, end in boundaries]
+    doc_vectors: List[List[float]] = []
+    for start, end in boundaries:
+        doc_chunks = torch.tensor(chunk_vectors[start:end])
+        doc_vector = torch.mean(doc_chunks, dim=0).tolist()
+        doc_vectors.append(doc_vector)
+
+    if return_chunk_vectors:
+        return doc_vectors, chunk_vectors
+    return doc_vectors
 
 
 def reduce_vectors(
@@ -171,59 +207,6 @@ def unzip_files(zip_filepath: str, extract_to_path: str) -> None:
         print(f"Error: Invalid zip file at {zip_filepath}")
 
 
-def improved_vectorise(
-    texts: List[List[str]],
-    model: str = "intfloat/multilingual-e5-large-instruct",
-    normalise: bool = True,
-    batch_size: int = 192,
-    gpu: bool = True,
-    progress: bool = True,
-    return_chunk_vectors: bool = True,
-    instruction_prefix: str = "Identify the stance or topic of Position papers based content of the segment",
-) -> Tuple[List[List[float]], List[List[float]]]:
-    def batch_gen(items, size):
-        for i in range(0, len(items), size):
-            yield items[i : i + size]
-
-    model_instance = AutoModel.from_pretrained(model)
-    tokeniser = AutoTokenizer.from_pretrained(model)
-    if gpu and torch.cuda.is_available():
-        model_instance = model_instance.to("cuda")
-    else:
-        gpu = False
-        print("GPU not available, using CPU instead")
-
-    all_chunks = []
-    chunk_boundaries = []
-    start = 0
-    for text_chunks in texts:
-        prefixed_chunks = [instruction_prefix + chunk for chunk in text_chunks]
-        all_chunks.extend(prefixed_chunks)
-        chunk_boundaries.append((start, start + len(text_chunks)))
-        start += len(text_chunks)
-
-    chunk_vectors: List[List[float]] = []
-    with tqdm(total=len(all_chunks), disable=not progress, unit=" chunk") as bar:
-        for batch in batch_gen(all_chunks, batch_size):
-            inputs = tokeniser(batch, padding="max_length", truncation=True, return_tensors="pt", max_length=512)
-            if gpu and torch.cuda.is_available():
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            with torch.no_grad():
-                outputs = model_instance(**inputs)
-                batch_vectors = outputs[0][:, 0]
-                if normalise:
-                    batch_vectors = torch.nn.functional.normalize(batch_vectors, p=2, dim=1)
-                batch_vectors = batch_vectors.cpu()
-                chunk_vectors.extend(batch_vectors.tolist())
-            bar.update(len(batch))
-
-    document_vectors = []
-    for start, end in chunk_boundaries:
-        doc_chunks = torch.tensor(chunk_vectors[start:end])
-        doc_vector = torch.mean(doc_chunks, dim=0).tolist()
-        document_vectors.append(doc_vector)
-
-    return document_vectors, chunk_vectors
 
 
 def preprocess_dataframe_columns(
