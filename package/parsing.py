@@ -8,12 +8,9 @@ import warnings
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup, Tag, NavigableString
+from tqdm import tqdm
 
-try:
-    from urlextract import URLExtract
-    HAS_URLEXTRACT = True
-except ImportError:
-    HAS_URLEXTRACT = False
+from urlextract import URLExtract
 
 warnings.filterwarnings('ignore')
 
@@ -92,16 +89,12 @@ def parse_message_content(df: pd.DataFrame,
         
         text_str = str(text)
         
-        if HAS_URLEXTRACT:
-            # Use URLExtract library for better URL detection
-            extractor = URLExtract()
-            urls = extractor.find_urls(text_str)
-            # Filter to only http/https URLs
-            urls = [url for url in urls if url.startswith(('http://', 'https://'))]
-        else:
-            # Improved regex pattern for better URL detection
-            url_pattern = r'https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w\-._~:/?#\[\]@!$&\'()*+,;=%])*)?'
-            urls = re.findall(url_pattern, text_str)
+        # Use URLExtract library for better URL detection
+        extractor = URLExtract()
+        urls = extractor.find_urls(text_str)
+        # Filter to only http/https URLs
+        urls = [url for url in urls if url.startswith(('http://', 'https://'))]
+
         
         # Clean and validate URLs
         cleaned_urls = []
@@ -150,7 +143,7 @@ def parse_message_content(df: pd.DataFrame,
                 
             except requests.exceptions.RequestException as e:
                 if attempt == max_retries - 1:
-                    return "", "", f"error: {str(e)}"
+                    return "", "", f"Request failed: {type(e).__name__}"
                 time.sleep(delay * (attempt + 1))
         
         return "", "", "error: max retries exceeded"
@@ -169,35 +162,45 @@ def parse_message_content(df: pd.DataFrame,
     if date_column not in df.columns:
         raise ValueError(f"Column '{date_column}' not found in dataframe")
     
-    results = []
-    print(f"Processing {len(df)} rows...")
-    
+    # First pass: collect all URLs
+    all_urls = []
     for idx, row in df.iterrows():
         text_content = row[url_column]
         urls = extract_urls_from_text(text_content)
         date_value = row[date_column]
         
-        if not urls:
-            continue
-            
         for url in urls:
             url = url.rstrip('.,;!?)')
-            domain = get_domain(url)
-            
-            print(f"Fetching metadata for: {url}")
-            title, description, status = get_page_metadata(url, timeout, max_retries)
-            
-            results.append({
-                'url': url,
-                'date': date_value,
-                'title': title,
-                'description': description,
-                'domain': domain,
-                'status': status,
-                'original_row_index': idx
-            })
-            
-            time.sleep(delay)
+            all_urls.append((idx, url, date_value))
+    
+    if not all_urls:
+        print("No URLs found in the dataset.")
+        return pd.DataFrame()
+    
+    print(f"Found {len(all_urls)} URLs from {len(df)} rows. Fetching metadata...")
+    
+    # Second pass: fetch metadata with progress bar
+    results = []
+    failed_urls = []
+    
+    for idx, url, date_value in tqdm(all_urls, desc="Fetching metadata"):
+        domain = get_domain(url)
+        title, description, status = get_page_metadata(url, timeout, max_retries)
+        
+        if status != "success":
+            failed_urls.append((url, status))
+        
+        results.append({
+            'url': url,
+            'date': date_value,
+            'title': title,
+            'description': description,
+            'domain': domain,
+            'status': status,
+            'original_row_index': idx
+        })
+        
+        time.sleep(delay)
     
     result_df = pd.DataFrame(results)
     
@@ -207,8 +210,16 @@ def parse_message_content(df: pd.DataFrame,
         except Exception:
             pass
     
-    print(f"Extraction complete! Found {len(result_df)} URLs from {len(df)} rows.")
-    print(f"Success rate: {len(result_df[result_df['status'] == 'success'])} / {len(result_df)} URLs")
+    # Print warnings for failed URLs
+    if failed_urls:
+        print(f"\nWarning: {len(failed_urls)} URLs failed to fetch metadata:")
+        for url, error in failed_urls[:5]:  # Show first 5 failures
+            print(f"  - {url}: {error}")
+        if len(failed_urls) > 5:
+            print(f"  ... and {len(failed_urls) - 5} more")
+    
+    success_count = len(result_df[result_df['status'] == 'success']) if not result_df.empty else 0
+    print(f"\nExtraction complete! Success rate: {success_count}/{len(result_df)} URLs ({success_count/len(result_df)*100:.1f}%)" if not result_df.empty else "No URLs processed.")
     
     return result_df
 
