@@ -12,3 +12,6 @@ scikit-learn
 umap-learn
 bertopic
 nltk
+requests
+beautifulsoup4
+urlextract
