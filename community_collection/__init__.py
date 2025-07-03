@@ -1,6 +1,6 @@
 """Community Collection utilities"""
 
-from .parsing import parse_message, create_combined_content
+from .parsing import parse_message, create_combined_content, parse_message_content, analyze_url_results
 from .nlp_utils import add_ner_columns, add_nounchunk_columns
 from .mapping import (
     tokenize,
@@ -28,6 +28,8 @@ from .mapping import (
 __all__ = [
     "parse_message",
     "create_combined_content",
+    "parse_message_content",
+    "analyze_url_results",
     "add_ner_columns",
     "add_nounchunk_columns",
     "tokenize",
