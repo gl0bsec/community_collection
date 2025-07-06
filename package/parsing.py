@@ -673,8 +673,7 @@ def extract_text_content(df: pd.DataFrame,
         clean_whitespace: Whether to clean up extra whitespace
     
     Returns:
-        DataFrame with columns: cleaned_text, date, original_text_length, 
-        cleaned_text_length, urls_removed_count, original_row_index
+        DataFrame with columns: cleaned_text, original_text, date
     """
     
     def remove_urls_from_text(text: str) -> Tuple[str, int]:
@@ -683,30 +682,84 @@ def extract_text_content(df: pd.DataFrame,
             return "", 0
         
         text_str = str(text)
-        url_pattern = r'https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w/_.])*(?:\?(?:[\w&=%.])*)?(?:#(?:[\w.])*)?)?'
         
-        urls_found = re.findall(url_pattern, text_str)
-        urls_count = len(urls_found)
-        cleaned_text = re.sub(url_pattern, ' ', text_str)
+        # Use URLExtract for more robust URL detection
+        extractor = URLExtract()
+        urls_found = extractor.find_urls(text_str)
         
-        return cleaned_text, urls_count
+        # Filter to common URL schemes and clean URLs
+        cleaned_urls = []
+        for url in urls_found:
+            # Remove trailing punctuation that's not part of URL
+            original_url = url
+            url = url.rstrip('.,;!?)}]"\'')
+            
+            # Only include http/https/ftp URLs and common www patterns
+            if (url.startswith(('http://', 'https://', 'ftp://', 'www.')) or 
+                ('.com' in url or '.org' in url or '.net' in url or '.edu' in url or 
+                 '.gov' in url or '.io' in url or '.co' in url)):
+                cleaned_urls.append((original_url, url))
+        
+        # Remove URLs from text while preserving sentence structure
+        cleaned_text = text_str
+        for original_url, cleaned_url in cleaned_urls:
+            # Check if URL is at start/end of sentence or standalone
+            url_pattern = re.escape(original_url)
+            
+            # Handle URLs at sentence boundaries more gracefully
+            # Replace URL with appropriate spacing based on context
+            if re.search(r'^\s*' + url_pattern + r'\s*$', cleaned_text, re.MULTILINE):
+                # URL is on its own line - remove entirely
+                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s*$', '', cleaned_text, flags=re.MULTILINE)
+            elif re.search(r'^\s*' + url_pattern + r'\s+', cleaned_text):
+                # URL at start of sentence - remove but keep following content
+                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s+', '', cleaned_text)
+            elif re.search(r'\s+' + url_pattern + r'\s*$', cleaned_text):
+                # URL at end of sentence - remove but preserve preceding content
+                cleaned_text = re.sub(r'\s+' + url_pattern + r'\s*$', '', cleaned_text)
+            elif re.search(r'\.\s*' + url_pattern + r'\s', cleaned_text):
+                # URL after sentence end - remove cleanly
+                cleaned_text = re.sub(r'\.\s*' + url_pattern + r'\s+', '. ', cleaned_text)
+            else:
+                # URL in middle of text - replace with single space
+                cleaned_text = re.sub(url_pattern, ' ', cleaned_text)
+        
+        return cleaned_text, len(cleaned_urls)
     
     def clean_text(text: str) -> str:
         """Clean up text by removing extra whitespace and normalizing."""
         if not text:
             return ""
         
+        # Remove empty lines and normalize line breaks
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        cleaned = ' '.join(lines)
+        
         # Remove extra whitespace
-        cleaned = ' '.join(text.split())
+        cleaned = ' '.join(cleaned.split())
         
         # Remove multiple punctuation marks
         cleaned = re.sub(r'[.]{2,}', '.', cleaned)
         cleaned = re.sub(r'[!]{2,}', '!', cleaned)
         cleaned = re.sub(r'[?]{2,}', '?', cleaned)
+        cleaned = re.sub(r'[-]{2,}', '-', cleaned)
         
         # Clean up common artifacts from URL removal
         cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
-        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = re.sub(r'\s+[.,;!?]$', '', cleaned)  # Remove trailing punctuation with spaces
+        cleaned = re.sub(r'^[.,;!?]\s+', '', cleaned)  # Remove leading punctuation with spaces
+        
+        # Fix spacing around punctuation
+        cleaned = re.sub(r'\s+([.,;!?])', r'\1', cleaned)  # Remove spaces before punctuation
+        cleaned = re.sub(r'([.,;!?])([^\s])', r'\1 \2', cleaned)  # Add space after punctuation if missing
+        
+        # Handle common text artifacts
+        cleaned = re.sub(r'\s+', ' ', cleaned)  # Multiple spaces to single space
+        cleaned = re.sub(r'\s*\.\s*\.', '.', cleaned)  # Fix broken ellipsis
+        cleaned = re.sub(r'\s*-\s*-', '-', cleaned)  # Fix broken dashes
+        
+        # Remove isolated punctuation
+        cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
         
         return cleaned.strip()
     
@@ -738,11 +791,8 @@ def extract_text_content(df: pd.DataFrame,
         if cleaned_length >= min_text_length:
             results.append({
                 'cleaned_text': cleaned_text,
-                'date': date_value,
-                'original_text_length': original_length,
-                'cleaned_text_length': cleaned_length,
-                'urls_removed_count': urls_removed,
-                'original_row_index': idx
+                'original_text': original_text_str,
+                'date': date_value
             })
     
     result_df = pd.DataFrame(results)
@@ -754,11 +804,6 @@ def extract_text_content(df: pd.DataFrame,
             pass
     
     print(f"Text extraction complete! Processed {len(result_df)} rows with sufficient text content.")
-    if not result_df.empty:
-        total_urls_removed = result_df['urls_removed_count'].sum()
-        avg_text_reduction = ((result_df['original_text_length'] - result_df['cleaned_text_length']) / result_df['original_text_length'] * 100).mean()
-        print(f"Total URLs removed: {total_urls_removed}")
-        print(f"Average text length reduction: {avg_text_reduction:.1f}%")
     
     return result_df
 
@@ -777,10 +822,8 @@ def analyze_text_results(df: pd.DataFrame) -> pd.DataFrame:
     
     analysis = {
         'total_text_entries': len(df),
-        'total_urls_removed': df['urls_removed_count'].sum(),
-        'avg_original_length': df['original_text_length'].mean(),
-        'avg_cleaned_length': df['cleaned_text_length'].mean(),
-        'avg_length_reduction': ((df['original_text_length'] - df['cleaned_text_length']) / df['original_text_length'] * 100).mean(),
+        'avg_original_length': df['original_text'].str.len().mean(),
+        'avg_cleaned_length': df['cleaned_text'].str.len().mean(),
         'date_range': f"{df['date'].min()} to {df['date'].max()}" if 'date' in df.columns else 'N/A'
     }
     
