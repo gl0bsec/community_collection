@@ -1,4 +1,4 @@
-# Convenient wrappers and utiliites for working with text data from online communities and the web
+# Convenient wrappers for working with text data from online communities and the web
 
 ## Package layout
 
