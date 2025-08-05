@@ -1,9 +1,4 @@
-# Community Collection
-
-This repository contains utilities for processing and analysing text data.
-
-The original notebooks have been refactored into a small Python package so
-pipelines can be built programmatically without relying on notebooks.
+# Convenient wrappers and utiliites for working with text data from online communities and the web
 
 ## Package layout
 
