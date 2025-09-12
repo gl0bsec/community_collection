@@ -1,20 +1,25 @@
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from threading import Lock
 import warnings
+import xml.etree.ElementTree as ET
+from datetime import datetime
+import json
+import io
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4 import BeautifulSoup, Tag
 from tqdm import tqdm
 
 from urlextract import URLExtract
 
 warnings.filterwarnings('ignore')
 
-
+##Text and URL extraction from content columns 
 def parse_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Parse Discord message, extracting content, URLs, and embed metadata.
     
@@ -65,22 +70,38 @@ def create_combined_content(df: pd.DataFrame) -> pd.DataFrame:
 def parse_message_content(df: pd.DataFrame, 
                          url_column: str, 
                          date_column: str,
-                         delay: float = 1.0,
+                         delay: float = 0.1,
                          timeout: int = 10,
-                         max_retries: int = 3) -> pd.DataFrame:
-    """Extract URLs from DataFrame and fetch their metadata.
+                         max_retries: int = 3,
+                         max_workers: int = 10,
+                         cache_duplicates: bool = True) -> pd.DataFrame:
+    """Extract URLs from DataFrame and fetch their metadata using concurrent processing.
     
     Args:
         df: DataFrame with URL and date columns
         url_column: Column name containing URLs
         date_column: Column name containing dates
-        delay: Seconds between requests (default: 1.0)
+        delay: Seconds between requests per domain (default: 0.1)
         timeout: Request timeout seconds (default: 10)
         max_retries: Max retry attempts (default: 3)
+        max_workers: Number of concurrent workers (default: 10)
+        cache_duplicates: Whether to cache duplicate URL results (default: True)
         
     Returns:
         DataFrame with columns: url, date, title, description, domain, status
     """
+    
+    # Shared session for connection pooling
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
+    
+    # URL cache and domain rate limiting
+    url_cache = {} if cache_duplicates else None
+    domain_locks = {}
+    domain_last_request = {}
+    cache_lock = Lock()
     
     def extract_urls_from_text(text: Union[str, Any]) -> List[str]:
         """Extract all URLs from text string using improved methods."""
@@ -94,7 +115,6 @@ def parse_message_content(df: pd.DataFrame,
         urls = extractor.find_urls(text_str)
         # Filter to only http/https URLs
         urls = [url for url in urls if url.startswith(('http://', 'https://'))]
-
         
         # Clean and validate URLs
         cleaned_urls = []
@@ -107,19 +127,72 @@ def parse_message_content(df: pd.DataFrame,
         
         return cleaned_urls
     
-    def get_page_metadata(url: str, timeout: int = 10, max_retries: int = 3) -> Tuple[str, str, str]:
-        """Fetch page title and description from URL.
+    def get_domain(url: str) -> str:
+        """Extract domain from URL."""
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc
+        except Exception:
+            return ""
+    
+    def get_page_metadata_cached(url: str, timeout: int = 10, max_retries: int = 3) -> Tuple[str, str, str]:
+        """Fetch page title and description from URL with caching and rate limiting."""
         
-        Returns:
-            Tuple of (title, description, status)
-        """
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        # Check cache first
+        if url_cache is not None:
+            with cache_lock:
+                if url in url_cache:
+                    cached_result = url_cache[url]
+                    return cached_result['title'], cached_result['description'], cached_result['status']
+        
+        domain = get_domain(url)
+        
+        # Domain-specific rate limiting
+        if domain:
+            if domain not in domain_locks:
+                domain_locks[domain] = Lock()
+            
+            with domain_locks[domain]:
+                # Check if we need to wait for this domain
+                if domain in domain_last_request:
+                    time_since_last = time.time() - domain_last_request[domain]
+                    if time_since_last < delay:
+                        time.sleep(delay - time_since_last)
+                
+                # Fetch metadata
+                title, description, status = get_page_metadata(url, timeout, max_retries)
+                
+                # Update last request time for this domain
+                domain_last_request[domain] = time.time()
+        else:
+            title, description, status = get_page_metadata(url, timeout, max_retries)
+        
+        # Cache result
+        if url_cache is not None:
+            with cache_lock:
+                url_cache[url] = {
+                    'title': title,
+                    'description': description,
+                    'status': status
+                }
+        
+        return title, description, status
+    
+    def get_page_metadata(url: str, timeout: int = 10, max_retries: int = 3) -> Tuple[str, str, str]:
+        """Fetch page title and description from URL with enhanced error handling."""
         
         for attempt in range(max_retries):
             try:
-                response = requests.get(url, headers=headers, timeout=timeout)
+                response = session.get(url, timeout=timeout)
+                
+                # Handle rate limiting
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    if attempt < max_retries - 1:
+                        time.sleep(min(retry_after, 60))  # Cap at 60 seconds
+                        continue
+                    return "", "", "rate_limited"
+                
                 response.raise_for_status()
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -135,26 +208,42 @@ def parse_message_content(df: pd.DataFrame,
                 if not meta_desc:
                     meta_desc = soup.find('meta', attrs={'name': 'twitter:description'})
                 
-                if meta_desc and hasattr(meta_desc, 'get'):
+                if meta_desc and isinstance(meta_desc, Tag):
                     content = meta_desc.get('content', '')
                     description = str(content).strip() if content else ''
                 
                 return title, description, "success"
                 
+            except requests.exceptions.Timeout:
+                if attempt == max_retries - 1:
+                    return "", "", "timeout"
+                time.sleep(min(2 ** attempt, 10))  # Exponential backoff, capped at 10s
             except requests.exceptions.RequestException as e:
                 if attempt == max_retries - 1:
-                    return "", "", f"Request failed: {type(e).__name__}"
-                time.sleep(delay * (attempt + 1))
+                    return "", "", f"error: {type(e).__name__}"
+                time.sleep(min(2 ** attempt, 10))  # Exponential backoff
         
-        return "", "", "error: max retries exceeded"
+        return "", "", "max_retries_exceeded"
     
-    def get_domain(url: str) -> str:
-        """Extract domain from URL."""
-        try:
-            parsed = urlparse(url)
-            return parsed.netloc
-        except Exception:
-            return ""
+    def process_url_batch(url_batch: List[Tuple[int, str, Any]]) -> List[Dict[str, Any]]:
+        """Process a batch of URLs concurrently."""
+        results = []
+        
+        for idx, url, date_value in url_batch:
+            domain = get_domain(url)
+            title, description, status = get_page_metadata_cached(url, timeout, max_retries)
+            
+            results.append({
+                'url': url,
+                'date': date_value,
+                'title': title,
+                'description': description,
+                'domain': domain,
+                'status': status,
+                'original_row_index': idx
+            })
+        
+        return results
     
     # Validate input columns
     if url_column not in df.columns:
@@ -177,30 +266,250 @@ def parse_message_content(df: pd.DataFrame,
         print("No URLs found in the dataset.")
         return pd.DataFrame()
     
-    print(f"Found {len(all_urls)} URLs from {len(df)} rows. Fetching metadata...")
+    # Remove duplicates if caching is enabled
+    if cache_duplicates:
+        unique_urls = []
+        seen_urls = set()
+        for item in all_urls:
+            if item[1] not in seen_urls:
+                unique_urls.append(item)
+                seen_urls.add(item[1])
+        print(f"Found {len(all_urls)} URLs ({len(unique_urls)} unique) from {len(df)} rows.")
+        all_urls = unique_urls
+    else:
+        print(f"Found {len(all_urls)} URLs from {len(df)} rows.")
     
-    # Second pass: fetch metadata with progress bar
+    # Process URLs concurrently with progress bar
     results = []
     failed_urls = []
     
-    for idx, url, date_value in tqdm(all_urls, desc="Fetching metadata"):
-        domain = get_domain(url)
-        title, description, status = get_page_metadata(url, timeout, max_retries)
+    # Split URLs into batches for concurrent processing
+    batch_size = max(1, len(all_urls) // max_workers)
+    url_batches = [all_urls[i:i + batch_size] for i in range(0, len(all_urls), batch_size)]
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all batches
+        futures = []
+        for batch in url_batches:
+            future = executor.submit(process_url_batch, batch)
+            futures.append(future)
         
-        if status != "success":
-            failed_urls.append((url, status))
+        # Process results with progress bar
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing URL batches"):
+            try:
+                batch_results = future.result()
+                results.extend(batch_results)
+            except Exception as e:
+                print(f"Batch processing error: {e}")
+    
+    # Close session
+    session.close()
+    
+    # Create DataFrame
+    result_df = pd.DataFrame(results)
+    
+    if not result_df.empty:
+        try:
+            result_df['date'] = pd.to_datetime(result_df['date'])
+        except Exception:
+            pass
         
-        results.append({
-            'url': url,
-            'date': date_value,
-            'title': title,
-            'description': description,
-            'domain': domain,
-            'status': status,
-            'original_row_index': idx
-        })
+        # Collect failed URLs
+        failed_urls = result_df[result_df['status'] != 'success']
+    
+    # Print statistics
+    if not result_df.empty:
+        success_count = len(result_df[result_df['status'] == 'success'])
+        print(f"\nExtraction complete! Success rate: {success_count}/{len(result_df)} URLs ({success_count/len(result_df)*100:.1f}%)")
         
-        time.sleep(delay)
+        if len(failed_urls) > 0:
+            print(f"Failed URLs by reason:")
+            failure_counts = failed_urls['status'].value_counts()
+            for reason, count in failure_counts.items():
+                print(f"  - {reason}: {count}")
+    else:
+        print("No URLs processed.")
+    
+    return result_df
+
+
+def combine_multiple_columns(df, column_names, new_col_name='combined_text',
+                           include_labels=True, separator='\n\n'):
+    """Combine multiple text columns into a new formatted column.
+
+    Args:
+        df: Input DataFrame
+        column_names: List of column names to combine
+        new_col_name: Name for new combined column
+        include_labels: Whether to include column names as labels
+        separator: Separator between text sections
+
+    Returns:
+        DataFrame with new combined column added
+    """
+    result_df = df.copy()
+
+    # Validate column names
+    for col_name in column_names:
+        if col_name not in df.columns:
+            raise ValueError(f"Column '{col_name}' not found in dataframe")
+
+    def format_content(row):
+        """Format the content for a single row"""
+        parts = []
+        for col_name in column_names:
+            val = row[col_name]
+            if pd.notna(val) and str(val).strip():
+                if include_labels:
+                    parts.append(f"{col_name}: {val}")
+                else:
+                    parts.append(str(val))
+        return separator.join(parts) if parts else ""
+
+    result_df[new_col_name] = df.apply(format_content, axis=1)
+    return result_df
+
+
+def extract_text_content(df: pd.DataFrame, 
+                        text_column: str, 
+                        date_column: str,
+                        min_text_length: int = 5,
+                        clean_whitespace: bool = True) -> pd.DataFrame:
+    """Extract text content from column while excluding all URLs.
+    
+    Args:
+        df: Input DataFrame containing text and dates
+        text_column: Column name containing text (potentially with URLs)
+        date_column: Column name containing dates
+        min_text_length: Minimum length of text to include
+        clean_whitespace: Whether to clean up extra whitespace
+    
+    Returns:
+        DataFrame with columns: cleaned_text, original_text, date
+    """
+    
+    def remove_urls_from_text(text: str) -> Tuple[str, int]:
+        """Remove all URLs from text and return cleaned text with count."""
+        if pd.isna(text):
+            return "", 0
+        
+        text_str = str(text)
+        
+        # Use URLExtract for more robust URL detection
+        extractor = URLExtract()
+        urls_found = extractor.find_urls(text_str)
+        
+        # Filter to common URL schemes and clean URLs
+        cleaned_urls = []
+        for url in urls_found:
+            # Remove trailing punctuation that's not part of URL
+            original_url = url
+            url = url.rstrip('.,;!?)}]"\'')
+            
+            # Only include http/https/ftp URLs and common www patterns
+            if (url.startswith(('http://', 'https://', 'ftp://', 'www.')) or 
+                ('.com' in url or '.org' in url or '.net' in url or '.edu' in url or 
+                 '.gov' in url or '.io' in url or '.co' in url)):
+                cleaned_urls.append((original_url, url))
+        
+        # Remove URLs from text while preserving sentence structure
+        cleaned_text = text_str
+        for original_url, _ in cleaned_urls:
+            # Check if URL is at start/end of sentence or standalone
+            url_pattern = re.escape(original_url)
+            
+            # Handle URLs at sentence boundaries more gracefully
+            # Replace URL with appropriate spacing based on context
+            if re.search(r'^\s*' + url_pattern + r'\s*$', cleaned_text, re.MULTILINE):
+                # URL is on its own line - remove entirely
+                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s*$', '', cleaned_text, flags=re.MULTILINE)
+            elif re.search(r'^\s*' + url_pattern + r'\s+', cleaned_text):
+                # URL at start of sentence - remove but keep following content
+                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s+', '', cleaned_text)
+            elif re.search(r'\s+' + url_pattern + r'\s*$', cleaned_text):
+                # URL at end of sentence - remove but preserve preceding content
+                cleaned_text = re.sub(r'\s+' + url_pattern + r'\s*$', '', cleaned_text)
+            elif re.search(r'\.\s*' + url_pattern + r'\s', cleaned_text):
+                # URL after sentence end - remove cleanly
+                cleaned_text = re.sub(r'\.\s*' + url_pattern + r'\s+', '. ', cleaned_text)
+            else:
+                # URL in middle of text - replace with single space
+                cleaned_text = re.sub(url_pattern, ' ', cleaned_text)
+        
+        return cleaned_text, len(cleaned_urls)
+    
+    def clean_text(text: str) -> str:
+        """Clean up text by removing extra whitespace and normalizing."""
+        if not text:
+            return ""
+        
+        # Remove empty lines and normalize line breaks
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        cleaned = ' '.join(lines)
+        
+        # Remove extra whitespace
+        cleaned = ' '.join(cleaned.split())
+        
+        # Remove multiple punctuation marks
+        cleaned = re.sub(r'[.]{2,}', '.', cleaned)
+        cleaned = re.sub(r'[!]{2,}', '!', cleaned)
+        cleaned = re.sub(r'[?]{2,}', '?', cleaned)
+        cleaned = re.sub(r'[-]{2,}', '-', cleaned)
+        
+        # Clean up common artifacts from URL removal
+        cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
+        cleaned = re.sub(r'\s+[.,;!?]$', '', cleaned)  # Remove trailing punctuation with spaces
+        cleaned = re.sub(r'^[.,;!?]\s+', '', cleaned)  # Remove leading punctuation with spaces
+        
+        # Fix spacing around punctuation
+        cleaned = re.sub(r'\s+([.,;!?])', r'\1', cleaned)  # Remove spaces before punctuation
+        cleaned = re.sub(r'([.,;!?])([^\s])', r'\1 \2', cleaned)  # Add space after punctuation if missing
+        
+        # Handle common text artifacts
+        cleaned = re.sub(r'\s+', ' ', cleaned)  # Multiple spaces to single space
+        cleaned = re.sub(r'\s*\.\s*\.', '.', cleaned)  # Fix broken ellipsis
+        cleaned = re.sub(r'\s*-\s*-', '-', cleaned)  # Fix broken dashes
+        
+        # Remove isolated punctuation
+        cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
+        
+        return cleaned.strip()
+    
+    # Validate input columns
+    if text_column not in df.columns:
+        raise ValueError(f"Column '{text_column}' not found in dataframe")
+    if date_column not in df.columns:
+        raise ValueError(f"Column '{date_column}' not found in dataframe")
+    
+    results = []
+    print(f"Processing {len(df)} rows for text extraction...")
+    
+    for _, row in df.iterrows():
+        original_text = row[text_column]
+        date_value = row[date_column]
+        
+        try:
+            is_na = bool(pd.isna(original_text))
+        except (ValueError, TypeError):
+            is_na = False
+        
+        if original_text is None or is_na or str(original_text).strip() == "":
+            continue
+        
+        original_text_str = str(original_text)
+        cleaned_text, _ = remove_urls_from_text(original_text_str)
+        
+        if clean_whitespace:
+            cleaned_text = clean_text(cleaned_text)
+        
+        cleaned_length = len(cleaned_text)
+        
+        if cleaned_length >= min_text_length:
+            results.append({
+                'cleaned_text': cleaned_text,
+                'original_text': original_text_str,
+                'date': date_value
+            })
     
     result_df = pd.DataFrame(results)
     
@@ -210,21 +519,54 @@ def parse_message_content(df: pd.DataFrame,
         except Exception:
             pass
     
-    # Print warnings for failed URLs
-    if failed_urls:
-        print(f"\nWarning: {len(failed_urls)} URLs failed to fetch metadata:")
-        for url, error in failed_urls[:5]:  # Show first 5 failures
-            print(f"  - {url}: {error}")
-        if len(failed_urls) > 5:
-            print(f"  ... and {len(failed_urls) - 5} more")
-    
-    success_count = len(result_df[result_df['status'] == 'success']) if not result_df.empty else 0
-    print(f"\nExtraction complete! Success rate: {success_count}/{len(result_df)} URLs ({success_count/len(result_df)*100:.1f}%)" if not result_df.empty else "No URLs processed.")
+    print(f"Text extraction complete! Processed {len(result_df)} rows with sufficient text content.")
     
     return result_df
 
 
-def extract_url_metadata(url: str, timeout: int = 10) -> Dict[str, Optional[str]]:
+def analyze_text_results(df: pd.DataFrame) -> pd.DataFrame:
+    """Analyze results from extract_text_content function.
+    
+    Args:
+        df: DataFrame from extract_text_content
+        
+    Returns:
+        Same DataFrame (for chaining)
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    analysis = {
+        'total_text_entries': len(df),
+        'avg_original_length': df['original_text'].str.len().mean(),
+        'avg_cleaned_length': df['cleaned_text'].str.len().mean(),
+        'date_range': f"{df['date'].min()} to {df['date'].max()}" if 'date' in df.columns else 'N/A'
+    }
+    
+    if 'date' in df.columns:
+        try:
+            entries_by_date = df.groupby(df['date'].dt.date).size() if pd.api.types.is_datetime64_any_dtype(df['date']) else df.groupby('date').size()
+        except Exception:
+            entries_by_date = df.groupby('date').size()
+    else:
+        entries_by_date = pd.Series()
+    
+    print("=== Text Extraction Analysis ===")
+    for key, value in analysis.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.2f}")
+        else:
+            print(f"{key}: {value}")
+    
+    if not entries_by_date.empty:
+        print(f"\nText entries by date:")
+        print(entries_by_date.head(10))
+    
+    return df
+
+
+#GDELT data parsing 
+def extract_url_metadata(url: str, timeout: int = 0) -> Dict[str, Optional[str]]:
     """Extract comprehensive metadata from a webpage URL.
     
     Args:
@@ -620,233 +962,366 @@ def analyze_source_metadata(df_with_metadata):
     successful = len(df_with_metadata[df_with_metadata['title'].notna()])
     print(f"\nMetadata extraction success rate: {successful}/{total_urls} ({successful/total_urls*100:.1f}%)")
 
-
-def combine_multiple_columns(df, column_names, new_col_name='combined_text',
-                           include_labels=True, separator='\n\n'):
-    """Combine multiple text columns into a new formatted column.
-
-    Args:
-        df: Input DataFrame
-        column_names: List of column names to combine
-        new_col_name: Name for new combined column
-        include_labels: Whether to include column names as labels
-        separator: Separator between text sections
-
-    Returns:
-        DataFrame with new combined column added
-    """
-    result_df = df.copy()
-
-    # Validate column names
-    for col_name in column_names:
-        if col_name not in df.columns:
-            raise ValueError(f"Column '{col_name}' not found in dataframe")
-
-    def format_content(row):
-        """Format the content for a single row"""
-        parts = []
-        for col_name in column_names:
-            val = row[col_name]
-            if pd.notna(val) and str(val).strip():
-                if include_labels:
-                    parts.append(f"{col_name}: {val}")
-                else:
-                    parts.append(str(val))
-        return separator.join(parts) if parts else ""
-
-    result_df[new_col_name] = df.apply(format_content, axis=1)
-    return result_df
-
-
-def extract_text_content(df: pd.DataFrame, 
-                        text_column: str, 
-                        date_column: str,
-                        min_text_length: int = 5,
-                        clean_whitespace: bool = True) -> pd.DataFrame:
-    """Extract text content from column while excluding all URLs.
+#RSS feed parsing 
+def parse_rss_feed(rss_url: str, timeout: int = 10) -> pd.DataFrame:
+    """Parse an RSS feed into a pandas DataFrame with individual fields for metadata and content.
     
     Args:
-        df: Input DataFrame containing text and dates
-        text_column: Column name containing text (potentially with URLs)
-        date_column: Column name containing dates
-        min_text_length: Minimum length of text to include
-        clean_whitespace: Whether to clean up extra whitespace
-    
+        rss_url: URL of the RSS feed to parse
+        timeout: Request timeout in seconds (default: 10)
+        
     Returns:
-        DataFrame with columns: cleaned_text, original_text, date
+        DataFrame with columns: title, description, link, published_date, guid, author, 
+                              categories, content, feed_title, feed_description, feed_link
     """
-    
-    def remove_urls_from_text(text: str) -> Tuple[str, int]:
-        """Remove all URLs from text and return cleaned text with count."""
-        if pd.isna(text):
-            return "", 0
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         
-        text_str = str(text)
+        response = requests.get(rss_url, headers=headers, timeout=timeout)
+        response.raise_for_status()
         
-        # Use URLExtract for more robust URL detection
-        extractor = URLExtract()
-        urls_found = extractor.find_urls(text_str)
+        root = ET.fromstring(response.content)
         
-        # Filter to common URL schemes and clean URLs
-        cleaned_urls = []
-        for url in urls_found:
-            # Remove trailing punctuation that's not part of URL
-            original_url = url
-            url = url.rstrip('.,;!?)}]"\'')
+        # Initialize feed-level metadata
+        feed_info: Dict[str, Optional[str]] = {
+            'feed_title': None,
+            'feed_description': None,
+            'feed_link': None,
+            'feed_language': None,
+            'feed_last_build_date': None
+        }
+        
+        # Extract feed-level information
+        channel = root.find('channel')
+        if channel is not None:
+            feed_info['feed_title'] = _get_text(channel.find('title'))
+            feed_info['feed_description'] = _get_text(channel.find('description'))
+            feed_info['feed_link'] = _get_text(channel.find('link'))
+            feed_info['feed_language'] = _get_text(channel.find('language'))
+            feed_info['feed_last_build_date'] = _get_text(channel.find('lastBuildDate'))
+        
+        # Extract items
+        items = []
+        item_elements = root.findall('.//item')
+        
+        for item in item_elements:
+            item_data = {
+                'title': _get_text(item.find('title')),
+                'description': _get_text(item.find('description')),
+                'link': _get_text(item.find('link')),
+                'published_date': _parse_date(_get_text(item.find('pubDate'))),
+                'guid': _get_text(item.find('guid')),
+                'author': _get_text(item.find('author')),
+                'categories': _get_categories(item),
+                'content': _get_content(item),
+                'comments': _get_text(item.find('comments')),
+                'enclosure_url': _get_enclosure_url(item),
+                'enclosure_type': _get_enclosure_type(item),
+                'enclosure_length': _get_enclosure_length(item)
+            }
             
-            # Only include http/https/ftp URLs and common www patterns
-            if (url.startswith(('http://', 'https://', 'ftp://', 'www.')) or 
-                ('.com' in url or '.org' in url or '.net' in url or '.edu' in url or 
-                 '.gov' in url or '.io' in url or '.co' in url)):
-                cleaned_urls.append((original_url, url))
+            # Add feed-level metadata to each item
+            item_data.update(feed_info)
+            items.append(item_data)
         
-        # Remove URLs from text while preserving sentence structure
-        cleaned_text = text_str
-        for original_url, cleaned_url in cleaned_urls:
-            # Check if URL is at start/end of sentence or standalone
-            url_pattern = re.escape(original_url)
-            
-            # Handle URLs at sentence boundaries more gracefully
-            # Replace URL with appropriate spacing based on context
-            if re.search(r'^\s*' + url_pattern + r'\s*$', cleaned_text, re.MULTILINE):
-                # URL is on its own line - remove entirely
-                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s*$', '', cleaned_text, flags=re.MULTILINE)
-            elif re.search(r'^\s*' + url_pattern + r'\s+', cleaned_text):
-                # URL at start of sentence - remove but keep following content
-                cleaned_text = re.sub(r'^\s*' + url_pattern + r'\s+', '', cleaned_text)
-            elif re.search(r'\s+' + url_pattern + r'\s*$', cleaned_text):
-                # URL at end of sentence - remove but preserve preceding content
-                cleaned_text = re.sub(r'\s+' + url_pattern + r'\s*$', '', cleaned_text)
-            elif re.search(r'\.\s*' + url_pattern + r'\s', cleaned_text):
-                # URL after sentence end - remove cleanly
-                cleaned_text = re.sub(r'\.\s*' + url_pattern + r'\s+', '. ', cleaned_text)
-            else:
-                # URL in middle of text - replace with single space
-                cleaned_text = re.sub(url_pattern, ' ', cleaned_text)
+        df = pd.DataFrame(items)
         
-        return cleaned_text, len(cleaned_urls)
-    
-    def clean_text(text: str) -> str:
-        """Clean up text by removing extra whitespace and normalizing."""
-        if not text:
-            return ""
+        # Convert published_date to datetime if possible
+        if not df.empty and 'published_date' in df.columns:
+            df['published_date'] = pd.to_datetime(df['published_date'], errors='coerce')
         
-        # Remove empty lines and normalize line breaks
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        cleaned = ' '.join(lines)
+        return df
         
-        # Remove extra whitespace
-        cleaned = ' '.join(cleaned.split())
-        
-        # Remove multiple punctuation marks
-        cleaned = re.sub(r'[.]{2,}', '.', cleaned)
-        cleaned = re.sub(r'[!]{2,}', '!', cleaned)
-        cleaned = re.sub(r'[?]{2,}', '?', cleaned)
-        cleaned = re.sub(r'[-]{2,}', '-', cleaned)
-        
-        # Clean up common artifacts from URL removal
-        cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
-        cleaned = re.sub(r'\s+[.,;!?]$', '', cleaned)  # Remove trailing punctuation with spaces
-        cleaned = re.sub(r'^[.,;!?]\s+', '', cleaned)  # Remove leading punctuation with spaces
-        
-        # Fix spacing around punctuation
-        cleaned = re.sub(r'\s+([.,;!?])', r'\1', cleaned)  # Remove spaces before punctuation
-        cleaned = re.sub(r'([.,;!?])([^\s])', r'\1 \2', cleaned)  # Add space after punctuation if missing
-        
-        # Handle common text artifacts
-        cleaned = re.sub(r'\s+', ' ', cleaned)  # Multiple spaces to single space
-        cleaned = re.sub(r'\s*\.\s*\.', '.', cleaned)  # Fix broken ellipsis
-        cleaned = re.sub(r'\s*-\s*-', '-', cleaned)  # Fix broken dashes
-        
-        # Remove isolated punctuation
-        cleaned = re.sub(r'\s+[.,;!?]\s+', ' ', cleaned)
-        
-        return cleaned.strip()
-    
-    # Validate input columns
-    if text_column not in df.columns:
-        raise ValueError(f"Column '{text_column}' not found in dataframe")
-    if date_column not in df.columns:
-        raise ValueError(f"Column '{date_column}' not found in dataframe")
-    
-    results = []
-    print(f"Processing {len(df)} rows for text extraction...")
-    
-    for idx, row in df.iterrows():
-        original_text = row[text_column]
-        date_value = row[date_column]
-        
-        if pd.isna(original_text) or not str(original_text).strip():
-            continue
-        
-        original_text_str = str(original_text)
-        original_length = len(original_text_str)
-        cleaned_text, urls_removed = remove_urls_from_text(original_text_str)
-        
-        if clean_whitespace:
-            cleaned_text = clean_text(cleaned_text)
-        
-        cleaned_length = len(cleaned_text)
-        
-        if cleaned_length >= min_text_length:
-            results.append({
-                'cleaned_text': cleaned_text,
-                'original_text': original_text_str,
-                'date': date_value
-            })
-    
-    result_df = pd.DataFrame(results)
-    
-    if not result_df.empty:
-        try:
-            result_df['date'] = pd.to_datetime(result_df['date'])
-        except Exception:
-            pass
-    
-    print(f"Text extraction complete! Processed {len(result_df)} rows with sufficient text content.")
-    
-    return result_df
-
-
-def analyze_text_results(df: pd.DataFrame) -> pd.DataFrame:
-    """Analyze results from extract_text_content function.
-    
-    Args:
-        df: DataFrame from extract_text_content
-        
-    Returns:
-        Same DataFrame (for chaining)
-    """
-    if df.empty:
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching RSS feed: {e}")
         return pd.DataFrame()
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return pd.DataFrame()
+
+
+def _get_text(element) -> Optional[str]:
+    """Extract text content from XML element."""
+    if element is not None and element.text:
+        return element.text.strip()
+    return None
+
+
+def _get_categories(item) -> List[str]:
+    """Extract all categories from an RSS item."""
+    categories = []
+    for category in item.findall('category'):
+        if category.text:
+            categories.append(category.text.strip())
+    return categories
+
+
+def _get_content(item) -> Optional[str]:
+    """Extract content from RSS item, checking multiple possible tags."""
+    # Try content:encoded first (common in WordPress feeds)
+    content_encoded = item.find('{http://purl.org/rss/1.0/modules/content/}encoded')
+    if content_encoded is not None and content_encoded.text:
+        return content_encoded.text.strip()
     
-    analysis = {
-        'total_text_entries': len(df),
-        'avg_original_length': df['original_text'].str.len().mean(),
-        'avg_cleaned_length': df['cleaned_text'].str.len().mean(),
-        'date_range': f"{df['date'].min()} to {df['date'].max()}" if 'date' in df.columns else 'N/A'
+    # Try description as fallback
+    description = item.find('description')
+    if description is not None and description.text:
+        return description.text.strip()
+    
+    return None
+
+
+def _get_enclosure_url(item) -> Optional[str]:
+    """Extract enclosure URL from RSS item."""
+    enclosure = item.find('enclosure')
+    if enclosure is not None:
+        return enclosure.get('url')
+    return None
+
+
+def _get_enclosure_type(item) -> Optional[str]:
+    """Extract enclosure type from RSS item."""
+    enclosure = item.find('enclosure')
+    if enclosure is not None:
+        return enclosure.get('type')
+    return None
+
+
+def _get_enclosure_length(item) -> Optional[str]:
+    """Extract enclosure length from RSS item."""
+    enclosure = item.find('enclosure')
+    if enclosure is not None:
+        return enclosure.get('length')
+    return None
+
+
+def _parse_date(date_string: Optional[str]) -> Optional[str]:
+    """Parse RSS date string to ISO format."""
+    if not date_string:
+        return None
+    
+    # Common RSS date formats
+    formats = [
+        '%a, %d %b %Y %H:%M:%S %z',  # RFC 2822
+        '%a, %d %b %Y %H:%M:%S GMT',
+        '%a, %d %b %Y %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S%z',       # ISO 8601
+        '%Y-%m-%dT%H:%M:%SZ',
+        '%Y-%m-%d %H:%M:%S'
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_string.strip(), fmt)
+            return dt.isoformat()
+        except ValueError:
+            continue
+    
+    # If no format matches, return original string
+    return date_string
+
+
+#Google sheets parsing 
+def parse_google_sheets(sheets_url: str, 
+                       credentials_path: Optional[str] = None,
+                       sheet_name: Optional[str] = None,
+                       timeout: int = 10) -> pd.DataFrame:
+    """Parse a Google Sheets URL into a pandas DataFrame.
+    
+    This function supports both public and private Google Sheets:
+    - Public sheets: Uses CSV export method (no authentication needed)
+    - Private sheets: Uses Google Sheets API with service account credentials
+    
+    Args:
+        sheets_url: Google Sheets URL (various formats supported)
+        credentials_path: Path to service account JSON file (for private sheets)
+        sheet_name: Name of specific sheet tab (optional, defaults to first sheet)
+        timeout: Request timeout in seconds (default: 10)
+        
+    Returns:
+        DataFrame with the Google Sheets data
+        
+    Examples:
+        # Public sheet (no auth needed)
+        df = parse_google_sheets('https://docs.google.com/spreadsheets/d/ABC123/edit')
+        
+        # Private sheet with service account
+        df = parse_google_sheets('https://docs.google.com/spreadsheets/d/ABC123/edit', 
+                               credentials_path='path/to/service-account.json')
+    """
+    
+    # Extract sheet ID and gid from URL
+    sheet_id, gid = _extract_sheet_info(sheets_url)
+    
+    if not sheet_id:
+        raise ValueError("Could not extract sheet ID from URL. Please check the URL format.")
+    
+    # First try CSV export method (works for public sheets)
+    try:
+        df = _parse_sheets_csv_export(sheet_id, gid, timeout)
+        if not df.empty:
+            return df
+    except Exception as e:
+        print(f"CSV export method failed: {e}")
+    
+    # If CSV export fails, try Google Sheets API
+    if credentials_path:
+        try:
+            df = _parse_sheets_api(sheet_id, credentials_path, sheet_name, timeout)
+            return df
+        except Exception as e:
+            print(f"Google Sheets API method failed: {e}")
+            raise
+    else:
+        raise ValueError(
+            "Sheet appears to be private. Please provide credentials_path for service account authentication, "
+            "or make the sheet public (Share > Anyone with the link > Viewer)."
+        )
+
+
+def _extract_sheet_info(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract sheet ID and gid from Google Sheets URL."""
+    
+    # Store original URL for gid extraction
+    original_url = url
+    
+    # Remove fragments from URL for sheet ID extraction
+    url = url.split('#')[0]
+    
+    # Pattern to match sheet ID
+    sheet_id_pattern = r'/spreadsheets/d/([a-zA-Z0-9-_]+)'
+    sheet_id_match = re.search(sheet_id_pattern, url)
+    
+    if not sheet_id_match:
+        return None, None
+    
+    sheet_id = sheet_id_match.group(1)
+    
+    # Extract gid from original URL (including fragments)
+    gid = None
+    if '#gid=' in original_url:
+        gid_match = re.search(r'#gid=(\d+)', original_url)
+        if gid_match:
+            gid = gid_match.group(1)
+    elif 'gid=' in original_url:
+        parsed_url = urlparse(original_url)
+        query_params = parse_qs(parsed_url.query)
+        if 'gid' in query_params:
+            gid = query_params['gid'][0]
+    
+    return sheet_id, gid
+
+
+def _parse_sheets_csv_export(sheet_id: str, gid: Optional[str], timeout: int) -> pd.DataFrame:
+    """Parse Google Sheets using CSV export method (public sheets only)."""
+    
+    # Construct CSV export URL
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    if gid:
+        csv_url += f"&gid={gid}"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
-    if 'date' in df.columns:
-        try:
-            entries_by_date = df.groupby(df['date'].dt.date).size() if pd.api.types.is_datetime64_any_dtype(df['date']) else df.groupby('date').size()
-        except Exception:
-            entries_by_date = df.groupby('date').size()
+    response = requests.get(csv_url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    
+    # Check if response is actually CSV data
+    if response.headers.get('content-type', '').startswith('text/csv') or len(response.text) > 0:
+        # Parse CSV data
+        df = pd.read_csv(io.StringIO(response.text))
+        return df
     else:
-        entries_by_date = pd.Series()
+        raise ValueError("Failed to retrieve CSV data. Sheet may be private or not accessible.")
+
+
+def _parse_sheets_api(sheet_id: str, 
+                     credentials_path: str, 
+                     sheet_name: Optional[str], 
+                     timeout: int) -> pd.DataFrame:
+    """Parse Google Sheets using Google Sheets API with service account credentials."""
     
-    print("=== Text Extraction Analysis ===")
-    for key, value in analysis.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.2f}")
+    try:
+        # Try to import google-auth and google-api-python-client
+        from google.auth import exceptions as auth_exceptions
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+    except ImportError:
+        raise ImportError(
+            "Google API client libraries not found. Install with: "
+            "pip install google-auth google-auth-oauthlib google-api-python-client"
+        )
+    
+    # Load service account credentials
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to load credentials from {credentials_path}: {e}")
+    
+    # Build the service
+    service = build('sheets', 'v4', credentials=credentials)
+    
+    # Get sheet metadata to find available sheets
+    try:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        sheets = sheet_metadata.get('sheets', [])
+        
+        if not sheets:
+            raise ValueError("No sheets found in the spreadsheet")
+        
+        # Determine which sheet to read
+        if sheet_name:
+            target_sheet = None
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    target_sheet = sheet
+                    break
+            if not target_sheet:
+                available_sheets = [s['properties']['title'] for s in sheets]
+                raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {available_sheets}")
         else:
-            print(f"{key}: {value}")
-    
-    if not entries_by_date.empty:
-        print(f"\nText entries by date:")
-        print(entries_by_date.head(10))
-    
-    return df
+            # Use first sheet if no name specified
+            target_sheet = sheets[0]
+        
+        sheet_title = target_sheet['properties']['title']
+        
+        # Read the sheet data
+        range_name = f"'{sheet_title}'"
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        if not values:
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(values[1:], columns=values[0]) if len(values) > 1 else pd.DataFrame()
+        
+        return df
+        
+    except HttpError as e:
+        if e.resp.status == 403:
+            raise ValueError(
+                "Access denied. Make sure the service account has access to the sheet, "
+                "or the sheet is shared with the service account email."
+            )
+        else:
+            raise ValueError(f"Google Sheets API error: {e}")
+    except Exception as e:
+        raise ValueError(f"Error accessing Google Sheets: {e}")
 
 
 def example_usage():

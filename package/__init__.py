@@ -11,6 +11,8 @@ from .parsing import (
     combine_multiple_columns,
     extract_text_content,
     analyze_text_results,
+    parse_rss_feed,
+    parse_google_sheets,
     example_usage,
 )
 from .nlp_utils import add_ner_columns, add_nounchunk_columns
@@ -48,6 +50,8 @@ __all__ = [
     "combine_multiple_columns",
     "extract_text_content",
     "analyze_text_results",
+    "parse_rss_feed",
+    "parse_google_sheets",
     "example_usage",
     "add_ner_columns",
     "add_nounchunk_columns",

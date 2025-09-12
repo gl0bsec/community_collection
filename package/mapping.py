@@ -206,9 +206,6 @@ def unzip_files(zip_filepath: str, extract_to_path: str) -> None:
     except zipfile.BadZipFile:
         print(f"Error: Invalid zip file at {zip_filepath}")
 
-
-
-
 def preprocess_dataframe_columns(
     df: pd.DataFrame,
     content_column: str,
@@ -371,7 +368,8 @@ def json_to_dataframe(json_path: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def use_bertopic_with_custom_vectors(chunk_vectors: List[List[float]], documents: List[str], n_topics: int = 7):
+def use_bertopic_with_custom_vectors(chunk_vectors: List[List[float]], documents: List[str], 
+    n_topics: int = 7, min_df=0.01, max_df=0.90):
     try:
         nltk.data.find("corpora/stopwords")
     except LookupError:
@@ -394,8 +392,8 @@ def use_bertopic_with_custom_vectors(chunk_vectors: List[List[float]], documents
 
     embeddings = np.array(chunk_vectors)
     umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric="cosine", random_state=42)
-    hdbscan_model = HDBSCAN(min_cluster_size=27, metric="euclidean", cluster_selection_method="eom", prediction_data=True, min_samples=2)
-    vectorizer = CountVectorizer(stop_words=extended_stopwords, ngram_range=(1, 2), min_df=0.10, max_df=0.90)
+    hdbscan_model = HDBSCAN(min_cluster_size=27, metric="cosine", cluster_selection_method="eom", prediction_data=True, min_samples=2)
+    vectorizer = CountVectorizer(stop_words=extended_stopwords, ngram_range=(1, 2), max_df=max_df, min_df=min_df)
 
     topic_model = BERTopic(
         embedding_model=None,
