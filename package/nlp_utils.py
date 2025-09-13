@@ -23,20 +23,25 @@ def _extract_text(value):
         return str(value)
 
 
-def _load_model(model: str):
-    """Load and cache spaCy model with GPU support."""
-    if model not in _model_cache:
+def _load_model(model: str, use_gpu: bool = True):
+    """Load and cache spaCy model with optional GPU support."""
+    cache_key = f"{model}_{use_gpu}"
+    if cache_key not in _model_cache:
         try:
-            spacy.require_gpu()
-            _model_cache[model] = spacy.load(model)
-        except OSError:
-            raise RuntimeError(f"spaCy model '{model}' not found. Please install it with: python -m spacy download {model}")
-        except Exception as e:
-            raise RuntimeError(f"spaCy GPU support is not available: {e}")
-    return _model_cache[model]
+            if use_gpu:
+                # Try to load with GPU support first
+                spacy.require_gpu()
+            _model_cache[cache_key] = spacy.load(model)
+        except Exception:
+            # Fall back to CPU if GPU is not available or model not found
+            try:
+                _model_cache[cache_key] = spacy.load(model)
+            except OSError:
+                raise RuntimeError(f"spaCy model '{model}' not found. Please install it with: python -m spacy download {model}")
+    return _model_cache[cache_key]
 
 
-def add_ner_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf") -> pd.DataFrame:
+def add_ner_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf", use_gpu: bool = True) -> pd.DataFrame:
     """Add NER entity columns for ``field``."""
     # Validate inputs
     if field not in df.columns:
@@ -49,7 +54,7 @@ def add_ner_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf"
         return out
     
     # Load model (cached)
-    nlp = _load_model(model)
+    nlp = _load_model(model, use_gpu)
 
     texts = [_extract_text(v) for v in df[field]]
 
@@ -66,7 +71,7 @@ def add_ner_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf"
     return out
 
 
-def add_nounchunk_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf") -> pd.DataFrame:
+def add_nounchunk_columns(df: pd.DataFrame, field: str, model: str = "en_core_web_trf", use_gpu: bool = True) -> pd.DataFrame:
     """Add noun chunk columns for ``field``."""
     # Validate inputs
     if field not in df.columns:
@@ -78,7 +83,7 @@ def add_nounchunk_columns(df: pd.DataFrame, field: str, model: str = "en_core_we
         return out
     
     # Load model (cached)
-    nlp = _load_model(model)
+    nlp = _load_model(model, use_gpu)
 
     texts = [_extract_text(v) for v in df[field]]
 
