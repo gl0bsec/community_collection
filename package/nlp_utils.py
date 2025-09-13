@@ -77,11 +77,6 @@ def add_nounchunk_columns(df: pd.DataFrame, field: str, model: str = "en_core_we
     if field not in df.columns:
         raise ValueError(f"Column '{field}' not found in dataframe")
     
-    if df.empty:
-        out = df.copy()
-        out[f"{field}_noun_chunks"] = []
-        return out
-    
     # Load model (cached)
     nlp = _load_model(model, use_gpu)
 
