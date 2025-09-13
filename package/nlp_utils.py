@@ -89,7 +89,7 @@ def add_nounchunk_columns(df: pd.DataFrame, field: str, model: str = "en_core_we
 
     noun_chunks = []
     # Note: noun chunks require the parser, so we only disable tagger and lemmatizer
-    for doc in nlp.pipe(texts, batch_size=50):
+    for doc in nlp.pipe(texts, disable=["tagger", "lemmatizer"], batch_size=50):
         noun_chunks.append([chunk.text for chunk in doc.noun_chunks])
 
     out = df.copy()
