@@ -163,7 +163,8 @@ def csv_column_to_list(file_path: str, column_name: str) -> List[str]:
     return df[column_name].dropna().astype(str).tolist()
 
 
-def save_reduced_vectors(clusterisable_vectors: List[List[float]], map_vectors: List[List[float]], clusterisable_filename: str, map_filename: str) -> None:
+def save_reduced_vectors(clusterisable_vectors: List[List[float]], map_vectors: List[List[float]],
+                          clusterisable_filename: str, map_filename: str) -> None:
     pd.DataFrame(clusterisable_vectors).to_csv(clusterisable_filename, index=False)
     pd.DataFrame(map_vectors).to_csv(map_filename, index=False)
 

@@ -1,0 +1,5 @@
+# Claude Code files
+.claude
+
+# Jupyter Notebook files
+*.ipynb
